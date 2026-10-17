@@ -3,14 +3,14 @@
 
 #include "SignalRHub.h"
 
-#define WIFI_SSID ""
-#define WIFI_PASSWORD ""
+#define WIFI_SSID "wifi_mesh"
+#define WIFI_PASSWORD "Zeus@1709"
 #define HUB_URL "http://192.168.1.9:5284/iot"
 
 SignalRHub hub;
 
-const int pinoButton = 1;
-const int pinoBuzzer = 0;
+const int pinoButton = PINO_BOTAO;
+const int pinoBuzzer = PINO_BUZZER;
 
 void setup()
 {
@@ -39,7 +39,11 @@ void setup()
                      { Serial.println("hub caiu, reconectando"); });
 
   hub.on("ReceiveSignal", [](JsonArrayConst args)
-         { Serial.printf("ReceiveSignal: %d\n", args[0].as<int>()); });
+         {
+          Serial.printf("ReceiveSignal: %d\n", args[0].as<int>());
+          digitalWrite(pinoBuzzer, LOW);
+          delay(150);
+          digitalWrite(pinoBuzzer, HIGH); });
 
   hub.begin(HUB_URL);
 
@@ -54,8 +58,19 @@ void setup()
 
 void loop()
 {
-  const bool apertado = (digitalRead(pinoButton) == LOW);
-  digitalWrite(pinoBuzzer, apertado ? LOW : HIGH);
+  static bool anterior = false;
+  static uint32_t ultimaBorda = 0;
+
+  const bool agora = (digitalRead(pinoButton) == LOW);
+
+  if (agora != anterior && millis() - ultimaBorda >= 40) {
+    ultimaBorda = millis();
+    anterior = agora;
+    if (agora && hub.connected()) {
+      Serial.println("botão apertado");
+      hub.send("SendSignal", DEVICE_ID);
+    }
+  }
 
   hub.loop();
 

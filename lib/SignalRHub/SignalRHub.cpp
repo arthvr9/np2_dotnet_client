@@ -26,8 +26,6 @@ void SignalRHub::setState(State s) {
 }
 
 void SignalRHub::loop() {
-  const uint32_t now = millis();
-
   switch (m_state) {
     case State::Idle:
       return;
@@ -39,22 +37,30 @@ void SignalRHub::loop() {
         return;
       }
       openWebSocket(wsUrl);
-      setState(State::Connecting);
+      if (m_state == State::Negotiating) setState(State::Connecting);
       return;
     }
 
     case State::Backoff:
-      if (now - m_stateSince >= kBackoffMs) setState(State::Negotiating);
+      if (millis() - m_stateSince >= kBackoffMs) setState(State::Negotiating);
       return;
 
     case State::Connecting:
-    case State::Handshaking:
+    case State::Handshaking: {
       m_ws.loop();
-      if (now - m_stateSince >= kServerTimeoutMs) dropConnection("timeout conectando/handshake");
+      // m_ws.loop() despacha eventos que mudam o estado e carimbam m_stateSince
+      // com um millis() POSTERIOR ao desta passada. Ler o relogio antes daqui
+      // faria a subtracao sem sinal estourar e derrubar a conexao recem-aberta.
+      if (m_state != State::Connecting && m_state != State::Handshaking) return;
+      if (millis() - m_stateSince >= kServerTimeoutMs) dropConnection("timeout conectando/handshake");
       return;
+    }
 
-    case State::Connected:
+    case State::Connected: {
       m_ws.loop();
+      if (m_state != State::Connected) return;
+
+      const uint32_t now = millis();
       if (now - m_lastReceived >= kServerTimeoutMs) {
         dropConnection("servidor mudo por 30s");
         return;
@@ -65,6 +71,7 @@ void SignalRHub::loop() {
         sendMessage(ping);
       }
       return;
+    }
   }
 }
 
