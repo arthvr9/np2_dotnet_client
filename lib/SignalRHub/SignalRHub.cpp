@@ -33,7 +33,12 @@ void SignalRHub::loop() {
     case State::Negotiating: {
       String wsUrl;
       if (!negotiate(wsUrl)) {
-        setState(State::Backoff);
+        if (m_authFalhou) {
+          m_authFalhou = false;
+          falhou("negotiate recusado (401/403)", kBackoffAuthMs);
+        } else {
+          falhou("negotiate falhou", 0);
+        }
         return;
       }
       openWebSocket(wsUrl);
@@ -42,7 +47,7 @@ void SignalRHub::loop() {
     }
 
     case State::Backoff:
-      if (millis() - m_stateSince >= kBackoffMs) setState(State::Negotiating);
+      if (millis() - m_stateSince >= m_backoffMs) setState(State::Negotiating);
       return;
 
     case State::Connecting:
@@ -76,6 +81,10 @@ void SignalRHub::loop() {
 }
 
 bool SignalRHub::negotiate(String& outWsUrl) {
+  // Renova o token antes de cada tentativa: um JWT expirado so se resolve
+  // buscando outro, nunca repetindo o negotiate com o mesmo.
+  if (m_tokenProvider) m_accessToken = m_tokenProvider();
+
   HTTPClient http;
   if (!http.begin(m_hubUrl + "/negotiate?negotiateVersion=1")) return false;
 
@@ -85,14 +94,24 @@ bool SignalRHub::negotiate(String& outWsUrl) {
   const int code = http.POST("");
   if (code != HTTP_CODE_OK) {
     // Codigo negativo = erro de transporte do HTTPClient; positivo = status HTTP.
-    if (code < 0) log_e("negotiate falhou: %s (%d)", HTTPClient::errorToString(code).c_str(), code);
-    else log_e("negotiate falhou: HTTP %d", code);
+    if (code == HTTP_CODE_UNAUTHORIZED || code == HTTP_CODE_FORBIDDEN) {
+      log_e("negotiate recusado: HTTP %d (token invalido ou expirado)", code);
+      m_accessToken = "";  // forca o provider a emitir um novo na proxima volta
+      m_authFalhou = true;
+    } else if (code < 0) {
+      log_e("negotiate falhou: %s (%d)", HTTPClient::errorToString(code).c_str(), code);
+    } else {
+      log_e("negotiate falhou: HTTP %d", code);
+    }
     http.end();
     return false;
   }
 
   JsonDocument doc;
-  const DeserializationError err = deserializeJson(doc, http.getStream());
+  // getString() e nao getStream(): o stream e o socket cru, sem de-chunking.
+  // Se a resposta vier com Transfer-Encoding: chunked, o parser engasga no
+  // tamanho hexadecimal do chunk antes de chegar no JSON.
+  const DeserializationError err = deserializeJson(doc, http.getString());
   http.end();
   if (err) {
     log_e("negotiate json invalido: %s", err.c_str());
@@ -200,6 +219,7 @@ void SignalRHub::dispatch(JsonDocument& doc) {
       return;
     }
     setState(State::Connected);
+    m_backoffMs = kBackoffMinMs;
     m_lastSent = millis();
     if (m_onConnected) m_onConnected();
     return;
@@ -261,8 +281,24 @@ void SignalRHub::dropConnection(const char* motivo) {
   m_ws.disconnect();
   m_rxBuffer = "";
   m_pending.clear();
-  log_w("conexao encerrada: %s", motivo);
+
+  // Uma conexao que chegou a vigorar nao e sintoma de servidor fora do ar:
+  // reinicia o backoff para reconectar rapido.
+  if (estavaConectado) m_backoffMs = kBackoffMinMs;
+  else m_backoffMs = min(m_backoffMs * 2, kBackoffMaxMs);
+
+  log_w("conexao encerrada: %s (proxima tentativa em %lums)", motivo, (unsigned long)m_backoffMs);
+  if (m_onError) m_onError(motivo);
   if (estavaConectado && m_onDisconnected) m_onDisconnected();
+}
+
+void SignalRHub::falhou(const char* motivo, uint32_t backoffMs) {
+  if (backoffMs) m_backoffMs = backoffMs;
+  else m_backoffMs = min(m_backoffMs * 2, kBackoffMaxMs);
+
+  setState(State::Backoff);
+  log_w("%s (proxima tentativa em %lums)", motivo, (unsigned long)m_backoffMs);
+  if (m_onError) m_onError(motivo);
 }
 
 bool SignalRHub::parseWsUrl(const String& url, String& host, uint16_t& port, String& path, bool& secure) {
